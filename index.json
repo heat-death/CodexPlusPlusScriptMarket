@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updated_at": "2026-05-21T14:27:12Z",
+  "updated_at": "2026-05-21T14:58:09Z",
   "scripts": [
     {
       "id": "codex-context-used-meter",
@@ -16,7 +16,7 @@
       ],
       "homepage": "https://github.com/Minghou-Lei/codex-context-used-meter",
       "script_url": "https://raw.githubusercontent.com/BigPizzaV3/CodexPlusPlusScriptMarket/main/scripts/codex-context-used-meter.js",
-      "sha256": "f13df61c833b58048ba3f88b9013440e729dc7bc016dc578b7c6a708853344c0"
+      "sha256": "568f3d7e2739ea38dc393526841454433394e7e8ff1cc2b00bb8c3567612d122"
     }
   ]
 }
