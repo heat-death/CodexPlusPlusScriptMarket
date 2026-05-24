@@ -5,7 +5,11 @@
   const STYLE_ID = "codex-context-meter-style";
   const ROOT_ID = "codex-context-meter";
   const CAPTURE_STATE_KEY = "__codexContextMeterCaptureState";
-  const SCRIPT_VERSION = 33;
+  const CONFIG_KEY = "__codexContextMeterConfig";
+  const UI_STATE_STORAGE_KEY = "__codexContextMeterUiState";
+  const PROVIDER_SUMMARY_KEY = "__codexContextMeterProviderSummary";
+  const PROVIDER_SUMMARY_EVENT = "codex-context-meter-provider-summary";
+  const SCRIPT_VERSION = 81;
   const UPDATE_INTERVAL_MS = 5000;
   const SLOW_SCAN_INTERVAL_MS = 30000;
   const SWITCH_RETRY_WINDOW_MS = 8000;
@@ -25,6 +29,50 @@
   const WINDOW_KEY_CACHE_MS = 10000;
   const MAX_TEXT_LENGTH = 120000;
   const MAX_CAPTURE_TEXT_LENGTH = 2000000;
+  const SPEND_HISTORY_WINDOW_MS = 60 * 60 * 1000;
+  const SPEND_HISTORY_MAX_ITEMS = 200;
+  const SPEND_HISTORY_CHART_WIDTH = 244;
+  const SPEND_HISTORY_CHART_HEIGHT = 72;
+  const SPEND_HISTORY_CHART_PADDING = 8;
+  const SPEND_HISTORY_CHART_AXIS_WIDTH = 52;
+  const SPEND_EFFECT_DURATION_MS = 3000;
+  const SPEND_EFFECT_FALLBACK_MS = 3200;
+  const CONTEXT_SPEND_DEDUPE_WINDOW_MS = UPDATE_INTERVAL_MS * 2 + MUTATION_UPDATE_DELAY_MS;
+  const CONTEXT_SPEND_DEDUPE_KEY = "__codexContextMeterContextSpendDedupe";
+  const PROVIDER_SPEND_DEDUPE_WINDOW_MS = 1500;
+  const PROVIDER_SPEND_DEDUPE_KEY = "__codexContextMeterProviderSpendDedupe";
+  const HISTORY_PANEL_CLOSE_DELAY_MS = 240;
+  const FLOAT_DRAG_HOLD_MS = 260;
+  const FLOAT_SCALE_MIN = 0.7;
+  const FLOAT_SCALE_MAX = 1.8;
+  const FLOAT_SCALE_STEP = 0.08;
+  const DEFAULT_FLOATING_UI = {
+    mode: "inline",
+    floatingLayout: "horizontal",
+    x: 16,
+    y: 10,
+    scale: 1,
+  };
+  const DEFAULT_UI_CONFIG = {
+    context: {
+      showUsedInsteadOfLeft: false,
+      compressionWarningLeftPercent: 20,
+      levelThresholds: {
+        criticalLeftPercent: 30,
+        dangerLeftPercent: 40,
+        warnLeftPercent: 50,
+        noticeLeftPercent: 60,
+      },
+    },
+    provider: {
+      levelThresholds: {
+        criticalLeftPercent: 30,
+        dangerLeftPercent: 40,
+        warnLeftPercent: 50,
+        noticeLeftPercent: 60,
+      },
+    },
+  };
   const CAPTURE_TEXT_HINT_RE = /context|token|usage|latestTokenUsageInfo|window|budget|remaining|上下文|令牌|使用|窗口/i;
   const THREAD_CONTENT_SELECTOR = [
     '[data-app-shell-main-content-layout*="thread"]',
@@ -124,9 +172,36 @@
     lastReading: null,
     readingsByConversationId: new Map(),
     lastAnimatedUsedByConversationId: new Map(),
+    lastAnimatedProviderUsedById: new Map(),
     root: null,
+    contextCard: null,
+    providerCard: null,
+    historyPanel: null,
     value: null,
     fill: null,
+    providerValue: null,
+    providerFill: null,
+    providerSummary: null,
+    inlineHost: null,
+    inlineBefore: null,
+    uiState: DEFAULT_FLOATING_UI,
+    contextMenu: null,
+    contextMenuCloseListener: null,
+    floatingPointerCleanup: null,
+    floatingDrag: null,
+    spendHistory: {
+      context: [],
+      provider: [],
+    },
+    spendEffectQueue: [],
+    spendEffectActive: null,
+    spendEffectTimer: 0,
+    contextSessionTotalsByConversationId: new Map(),
+    providerSessionTotalsByConversationId: new Map(),
+    historyCloseTimer: 0,
+    historyHoverCleanup: null,
+    uiConfig: DEFAULT_UI_CONFIG,
+    providerSummaryListener: null,
     lastScanAt: 0,
     lastScannedConversationId: null,
     navigationPendingUntil: 0,
@@ -178,38 +253,157 @@
   }
 
   function installStyle() {
-    if (document.getElementById(STYLE_ID)) return;
+    const existingStyle = document.getElementById(STYLE_ID);
+    if (existingStyle && existingStyle.dataset.version === String(SCRIPT_VERSION)) return;
+    existingStyle?.remove();
 
     const style = document.createElement("style");
     style.id = STYLE_ID;
+    style.dataset.version = String(SCRIPT_VERSION);
     style.textContent = `
       #${ROOT_ID} {
+        --ccm-ring-size: 22px;
+        --ccm-ring-width: 3px;
+        --ccm-inline-max-width: 210px;
         position: fixed;
-        top: max(10px, env(safe-area-inset-top));
-        left: 50%;
-        transform: translateX(-50%);
+        top: var(--ccm-float-y, 10px);
+        left: var(--ccm-float-x, 16px);
+        transform: scale(var(--ccm-float-scale, 1));
+        transform-origin: top left;
         z-index: 2147483647;
-        min-width: 220px;
-        max-width: min(420px, calc(100vw - 32px));
-        padding: 8px 10px 9px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 8px;
+        min-height: var(--ccm-ring-size);
+        max-width: calc(100vw - 32px);
+        overflow: visible;
+        pointer-events: auto;
+        user-select: none;
+        /* Codex/Electron 顶部可能是窗口拖拽区；不退出拖拽区时，真实鼠标 hover 会被系统层吞掉。 */
+        -webkit-app-region: no-drag;
+      }
+
+      #${ROOT_ID}[data-placement="inline"] {
+        position: relative;
+        inset: auto;
+        z-index: auto;
+        transform: none;
+        flex: 0 0 auto;
+        align-self: center;
+        max-width: min(42vw, 360px);
+        margin-right: 8px;
+        justify-content: flex-start;
+      }
+
+      #${ROOT_ID}[data-placement="inline"] .ccm-card {
+        width: var(--ccm-ring-size);
+        max-width: var(--ccm-ring-size);
+        padding: 0;
+        border: 0;
+        background: transparent;
+        box-shadow: none;
+        backdrop-filter: none;
+      }
+
+      #${ROOT_ID}[data-placement="inline"] .ccm-row {
+        gap: 0;
+      }
+
+      #${ROOT_ID}[data-placement="inline"] .ccm-value,
+      #${ROOT_ID}[data-placement="inline"] .ccm-provider-value,
+      #${ROOT_ID}[data-placement="inline"] .ccm-history-panel {
+        display: none !important;
+      }
+
+      #${ROOT_ID}[data-placement="floating"] {
+        cursor: default;
+      }
+
+      #${ROOT_ID}[data-placement="floating"][data-floating-layout="vertical"] {
+        flex-direction: column;
+        align-items: stretch;
+      }
+
+      #${ROOT_ID}[data-dragging="true"] {
+        cursor: grabbing;
+      }
+
+      #${ROOT_ID}[hidden] {
+        display: none !important;
+      }
+
+      #${ROOT_ID} .ccm-card {
+        position: relative;
+        box-sizing: border-box;
+        flex: 0 1 auto;
+        width: auto;
+        min-width: 0;
+        max-width: var(--ccm-inline-max-width);
+        padding: 5px 8px;
         border: 1px solid rgba(255, 255, 255, 0.16);
-        border-radius: 8px;
-        background: rgba(20, 22, 28, 0.88);
+        border-radius: 999px;
+        background: rgba(20, 22, 28, 0.78);
         color: rgba(255, 255, 255, 0.92);
-        box-shadow: 0 8px 28px rgba(0, 0, 0, 0.24);
+        box-shadow: 0 5px 18px rgba(0, 0, 0, 0.18);
         font: 12px/1.35 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
         overflow: visible;
-        pointer-events: none;
-        user-select: none;
         backdrop-filter: blur(10px);
+        pointer-events: auto;
+        -webkit-app-region: no-drag;
+      }
+
+      #${ROOT_ID}[data-placement="floating"] .ccm-card {
+        max-width: 240px;
+        padding: 8px 10px 9px;
+        border-radius: 8px;
+        background: rgba(20, 22, 28, 0.88);
+        box-shadow: 0 8px 28px rgba(0, 0, 0, 0.24);
+      }
+
+      #${ROOT_ID}[data-placement="floating"] .ccm-row {
+        justify-content: center;
+        margin-bottom: 6px;
+      }
+
+      #${ROOT_ID}[data-placement="floating"] .ccm-ring {
+        display: none;
+      }
+
+      #${ROOT_ID}[data-placement="floating"] .ccm-track {
+        display: block;
+      }
+
+      #${ROOT_ID} .ccm-card[hidden] {
+        display: none !important;
       }
 
       #${ROOT_ID} .ccm-row {
         display: flex;
         align-items: center;
-        justify-content: center;
-        margin-bottom: 6px;
+        justify-content: flex-start;
+        gap: 7px;
+        min-width: 0;
+        margin-bottom: 0;
         white-space: nowrap;
+      }
+
+      #${ROOT_ID} .ccm-ring {
+        position: relative;
+        flex: 0 0 var(--ccm-ring-size);
+        width: var(--ccm-ring-size);
+        height: var(--ccm-ring-size);
+        border-radius: 50%;
+        background:
+          conic-gradient(var(--ccm-fill-color, #4ade80) 0deg, var(--ccm-fill-color, #4ade80) var(--ccm-ring-angle, 0deg), rgba(255, 255, 255, 0.18) var(--ccm-ring-angle, 0deg) 360deg);
+      }
+
+      #${ROOT_ID} .ccm-ring::after {
+        content: "";
+        position: absolute;
+        inset: var(--ccm-ring-width);
+        border-radius: 50%;
+        background: rgba(20, 22, 28, 0.96);
       }
 
       #${ROOT_ID} .ccm-value {
@@ -217,11 +411,13 @@
         font-weight: 650;
         font-variant-numeric: tabular-nums;
         overflow: hidden;
-        text-align: center;
+        text-align: left;
         text-overflow: ellipsis;
       }
 
       #${ROOT_ID} .ccm-track {
+        display: none;
+        position: relative;
         width: 100%;
         height: 7px;
         overflow: hidden;
@@ -230,28 +426,315 @@
       }
 
       #${ROOT_ID} .ccm-fill {
+        --ccm-fill-color: #4ade80;
+        --ccm-fill-gradient: linear-gradient(90deg, #4ea1ff, #4ade80);
         width: 0%;
         height: 100%;
         border-radius: inherit;
-        background: linear-gradient(90deg, #4ea1ff, #4ade80);
+        background: var(--ccm-fill-gradient);
         transition: width 180ms ease, background 180ms ease;
       }
 
-      #${ROOT_ID}[data-level="warn"] .ccm-fill {
-        background: linear-gradient(90deg, #f59e0b, #f97316);
+      #${ROOT_ID} .ccm-compression-zone {
+        position: absolute;
+        inset: 0 auto 0 0;
+        z-index: 1;
+        width: 0%;
+        border-radius: inherit;
+        background:
+          linear-gradient(90deg, rgba(255, 196, 0, 0.2), rgba(255, 126, 34, 0.12)),
+          repeating-linear-gradient(
+            -45deg,
+            rgba(253, 224, 71, 0.72) 0,
+            rgba(253, 224, 71, 0.72) 4px,
+            rgba(251, 146, 60, 0.64) 4px,
+            rgba(251, 146, 60, 0.64) 8px
+          );
+        box-shadow:
+          inset 0 0 0 1px rgba(251, 191, 36, 0.38),
+          inset 0 0 7px rgba(251, 146, 60, 0.18);
+        opacity: 0.82;
+        pointer-events: none;
+        transition: width 180ms ease, opacity 180ms ease;
       }
 
-      #${ROOT_ID}[data-level="danger"] .ccm-fill {
-        background: linear-gradient(90deg, #fb7185, #ef4444);
+      #${ROOT_ID} .ccm-provider-value {
+        color: rgba(255, 255, 255, 0.98);
+        font-weight: 650;
+        font-variant-numeric: tabular-nums;
+        overflow: hidden;
+        text-align: left;
+        text-overflow: ellipsis;
       }
 
-      #${ROOT_ID}[hidden] {
+      #${ROOT_ID} .ccm-context-card[data-level="warn"] .ccm-fill,
+      #${ROOT_ID} .ccm-context-card[data-level="warn"] .ccm-ring,
+      #${ROOT_ID} .ccm-provider-card[data-level="warn"] .ccm-ring,
+      #${ROOT_ID} .ccm-provider-card[data-level="warn"] .ccm-fill {
+        --ccm-fill-color: #f97316;
+        --ccm-fill-gradient: linear-gradient(90deg, #f59e0b, #f97316);
+      }
+
+      #${ROOT_ID} .ccm-context-card[data-level="danger"] .ccm-fill,
+      #${ROOT_ID} .ccm-context-card[data-level="danger"] .ccm-ring,
+      #${ROOT_ID} .ccm-provider-card[data-level="danger"] .ccm-ring,
+      #${ROOT_ID} .ccm-provider-card[data-level="danger"] .ccm-fill {
+        --ccm-fill-color: #ef4444;
+        --ccm-fill-gradient: linear-gradient(90deg, #fb7185, #ef4444);
+      }
+
+      #${ROOT_ID} .ccm-context-card[data-level="notice"] .ccm-fill,
+      #${ROOT_ID} .ccm-context-card[data-level="notice"] .ccm-ring,
+      #${ROOT_ID} .ccm-provider-card[data-level="notice"] .ccm-ring,
+      #${ROOT_ID} .ccm-provider-card[data-level="notice"] .ccm-fill {
+        --ccm-fill-color: #38bdf8;
+        --ccm-fill-gradient: linear-gradient(90deg, #22d3ee, #38bdf8);
+      }
+
+      #${ROOT_ID} .ccm-context-card[data-level="critical"] .ccm-fill,
+      #${ROOT_ID} .ccm-context-card[data-level="critical"] .ccm-ring,
+      #${ROOT_ID} .ccm-provider-card[data-level="critical"] .ccm-ring,
+      #${ROOT_ID} .ccm-provider-card[data-level="critical"] .ccm-fill {
+        --ccm-fill-color: #dc2626;
+        --ccm-fill-gradient: linear-gradient(90deg, #f43f5e, #dc2626);
+      }
+
+      #${ROOT_ID} .ccm-context-card[data-compression-warning="true"] .ccm-compression-zone {
+        opacity: 1;
+      }
+
+      #${ROOT_ID} .ccm-context-card[data-show-used-instead-of-left="true"] .ccm-compression-zone {
+        left: auto;
+        right: 0;
+      }
+
+      #${ROOT_ID} .ccm-history-panel {
+        position: absolute;
+        top: calc(100% + 8px);
+        left: 0;
+        right: auto;
+        z-index: 1;
+        box-sizing: border-box;
+        width: max-content;
+        min-width: 240px;
+        max-width: min(560px, calc(100vw - 32px));
+        padding: 9px 10px 10px;
+        border: 1px solid rgba(255, 255, 255, 0.14);
+        border-radius: 8px;
+        background: rgba(16, 18, 24, 0.94);
+        color: rgba(255, 255, 255, 0.9);
+        box-shadow: 0 10px 30px rgba(0, 0, 0, 0.28);
+        font: 12px/1.35 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        opacity: 0;
+        transform: translateY(-4px);
+        pointer-events: none;
+        visibility: hidden;
+        backdrop-filter: blur(12px);
+        -webkit-app-region: no-drag;
+        transition: opacity 140ms ease, transform 140ms ease, visibility 140ms ease;
+      }
+
+      #${ROOT_ID} .ccm-history-panel::before {
+        content: "";
+        position: absolute;
+        left: 0;
+        right: 0;
+        top: -8px;
+        height: 8px;
+        pointer-events: auto;
+      }
+
+      #${ROOT_ID}[data-history-open="true"] .ccm-history-panel {
+        opacity: 1;
+        transform: translateY(0);
+        pointer-events: auto;
+        visibility: visible;
+      }
+
+      #${ROOT_ID} .ccm-history-grid {
+        display: grid;
+        grid-template-columns: minmax(0, 260px) minmax(0, 260px);
+        gap: 12px;
+      }
+
+      #${ROOT_ID} .ccm-history-grid[data-provider-visible="false"] {
+        grid-template-columns: minmax(0, 292px);
+      }
+
+      #${ROOT_ID} .ccm-history-section {
+        min-width: 0;
+        --ccm-history-accent: #38bdf8;
+        --ccm-history-fill: rgba(56, 189, 248, 0.12);
+      }
+
+      #${ROOT_ID} .ccm-history-section[data-history-kind="provider"] {
+        --ccm-history-accent: #f97316;
+        --ccm-history-fill: rgba(249, 115, 22, 0.12);
+      }
+
+      #${ROOT_ID} .ccm-history-section[hidden] {
         display: none !important;
+      }
+
+      #${ROOT_ID} .ccm-history-head {
+        display: flex;
+        align-items: baseline;
+        justify-content: space-between;
+        gap: 8px;
+        margin-bottom: 6px;
+        white-space: nowrap;
+      }
+
+      #${ROOT_ID} .ccm-history-title {
+        color: rgba(255, 255, 255, 0.98);
+        font-weight: 700;
+      }
+
+      #${ROOT_ID} .ccm-history-total {
+        color: rgba(255, 255, 255, 0.72);
+        font-variant-numeric: tabular-nums;
+      }
+
+      #${ROOT_ID} .ccm-history-chart {
+        position: relative;
+        width: 100%;
+        min-height: 78px;
+      }
+
+      #${ROOT_ID} .ccm-history-svg {
+        display: block;
+        width: 100%;
+        height: 78px;
+        overflow: visible;
+      }
+
+      #${ROOT_ID} .ccm-history-axis-line {
+        fill: none;
+        stroke: rgba(255, 255, 255, 0.16);
+        stroke-width: 1;
+        vector-effect: non-scaling-stroke;
+      }
+
+      #${ROOT_ID} .ccm-history-axis-label {
+        fill: rgba(255, 255, 255, 0.46);
+        font-size: 10px;
+        font-variant-numeric: tabular-nums;
+      }
+
+      #${ROOT_ID} .ccm-history-gridline {
+        fill: none;
+        stroke: rgba(255, 255, 255, 0.1);
+        stroke-dasharray: 2 4;
+        stroke-width: 1;
+      }
+
+      #${ROOT_ID} .ccm-history-area {
+        fill: var(--ccm-history-fill);
+      }
+
+      #${ROOT_ID} .ccm-history-line {
+        fill: none;
+        stroke: var(--ccm-history-accent);
+        stroke-linecap: round;
+        stroke-linejoin: round;
+        stroke-width: 2.2;
+        vector-effect: non-scaling-stroke;
+      }
+
+      #${ROOT_ID} .ccm-history-point {
+        fill: #fff7ed;
+        stroke: var(--ccm-history-accent);
+        stroke-width: 1.5;
+      }
+
+      #${ROOT_ID} .ccm-history-hit {
+        fill: transparent;
+        pointer-events: all;
+      }
+
+      #${ROOT_ID} .ccm-history-caption {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+        margin-top: 2px;
+        color: rgba(255, 255, 255, 0.48);
+        font-size: 11px;
+        font-variant-numeric: tabular-nums;
+        white-space: nowrap;
+      }
+
+      #${ROOT_ID} .ccm-history-empty {
+        position: absolute;
+        inset: 19px 0 auto 0;
+        color: rgba(255, 255, 255, 0.46);
+      }
+
+      .ccm-context-menu {
+        position: fixed;
+        z-index: 2147483647;
+        min-width: 150px;
+        padding: 5px;
+        border: 1px solid rgba(255, 255, 255, 0.14);
+        border-radius: 8px;
+        background: rgba(18, 20, 26, 0.96);
+        color: rgba(255, 255, 255, 0.92);
+        box-shadow: 0 12px 32px rgba(0, 0, 0, 0.36);
+        font: 12px/1.35 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        backdrop-filter: blur(12px);
+        -webkit-app-region: no-drag;
+      }
+
+      .ccm-context-menu button {
+        display: flex;
+        align-items: center;
+        gap: 7px;
+        box-sizing: border-box;
+        width: 100%;
+        padding: 6px 8px;
+        border: 0;
+        border-radius: 6px;
+        background: transparent;
+        color: inherit;
+        font: inherit;
+        text-align: left;
+        cursor: pointer;
+      }
+
+      .ccm-context-menu button:hover {
+        background: rgba(255, 255, 255, 0.1);
+      }
+
+      .ccm-context-menu button[aria-checked="true"] {
+        background: rgba(255, 255, 255, 0.08);
+      }
+
+      .ccm-context-menu .ccm-menu-separator {
+        height: 1px;
+        margin: 5px 4px;
+        background: rgba(255, 255, 255, 0.12);
+      }
+
+      .ccm-context-menu .ccm-menu-check {
+        flex: 0 0 14px;
+        width: 14px;
+        color: #86efac;
+        font-weight: 800;
+        text-align: center;
+      }
+
+      .ccm-context-menu .ccm-menu-hint {
+        padding: 5px 8px 6px 21px;
+        color: rgba(255, 255, 255, 0.48);
+        font-size: 11px;
+        line-height: 1.3;
+        white-space: nowrap;
       }
 
       #${ROOT_ID} .ccm-hit-pop {
         position: absolute;
-        right: calc(100% + 10px);
+        left: 0;
+        right: auto;
         top: 50%;
         z-index: 1;
         color: #fff7ed;
@@ -268,9 +751,9 @@
           drop-shadow(0 0 14px rgba(251, 113, 133, 0.56))
           drop-shadow(0 0 26px rgba(249, 115, 22, 0.24));
         text-shadow: 0 0 1px rgba(255, 255, 255, 0.45);
-        transform: translate(44px, -50%) scale(0.72);
-        transform-origin: right center;
-        animation: ccm-hit-pop 3000ms cubic-bezier(0.16, 0.84, 0.24, 1) forwards;
+        transform: translate(-108%, -50%) scale(0.72);
+        transform-origin: center center;
+        animation: ccm-hit-pop ${SPEND_EFFECT_DURATION_MS}ms cubic-bezier(0.16, 0.84, 0.24, 1) forwards;
         pointer-events: none;
         white-space: nowrap;
         will-change: opacity, transform, filter;
@@ -279,19 +762,30 @@
       @keyframes ccm-hit-pop {
         0% {
           opacity: 0;
-          transform: translate(44px, -50%) scale(0.72);
+          transform: translate(-108%, -50%) scale(0.72);
         }
         12% {
           opacity: 1;
-          transform: translate(8px, -50%) scale(1);
+          transform: translate(-114%, -51%) scale(1);
         }
         72% {
           opacity: 1;
-          transform: translate(-128px, -50%) scale(1.82);
+          transform: translate(-146%, -54%) scale(1.22);
         }
         100% {
           opacity: 0;
-          transform: translate(-176px, -50%) scale(2.08);
+          transform: translate(-160%, -55%) scale(1.34);
+        }
+      }
+
+      @media (max-width: 720px) {
+        #${ROOT_ID}[data-placement="inline"] {
+          max-width: 72px;
+        }
+
+        #${ROOT_ID}[data-placement="inline"] .ccm-value,
+        #${ROOT_ID}[data-placement="inline"] .ccm-provider-value {
+          display: none;
         }
       }
     `;
@@ -301,29 +795,468 @@
   function ensureRoot() {
     let root = document.getElementById(ROOT_ID);
     if (root) {
+      root.querySelector(".ccm-hover-zone")?.remove();
+      const contextTrack = root.querySelector(".ccm-context-card .ccm-track");
+      if (contextTrack && !contextTrack.querySelector(".ccm-compression-zone")) {
+        contextTrack.insertBefore(document.createElement("div"), contextTrack.firstChild);
+        contextTrack.firstElementChild.className = "ccm-compression-zone";
+      }
       state.root = root;
+      state.contextCard = root.querySelector(".ccm-context-card");
+      state.providerCard = root.querySelector(".ccm-provider-card");
+      state.historyPanel = root.querySelector(".ccm-history-panel");
       state.value = root.querySelector(".ccm-value");
       state.fill = root.querySelector(".ccm-fill");
+      state.providerValue = root.querySelector(".ccm-provider-value");
+      state.providerFill = root.querySelector(".ccm-provider-fill");
+      installHistoryHover(root);
+      installContextMenu(root);
+      installFloatingControls(root);
+      mountRoot(root);
       return root;
     }
 
     root = document.createElement("div");
     root.id = ROOT_ID;
-    root.dataset.known = "false";
-    root.dataset.level = "normal";
     root.innerHTML = `
-      <div class="ccm-row">
-        <span class="ccm-value">Context Left --</span>
+      <div class="ccm-card ccm-context-card" data-known="false" data-level="normal" hidden>
+        <div class="ccm-row">
+          <span class="ccm-ring" aria-hidden="true"></span>
+          <span class="ccm-value">Context Left --</span>
+        </div>
+        <div class="ccm-track">
+          <div class="ccm-compression-zone"></div>
+          <div class="ccm-fill"></div>
+        </div>
       </div>
-      <div class="ccm-track">
-        <div class="ccm-fill"></div>
+      <div class="ccm-card ccm-provider-card" data-known="false" data-level="normal" hidden>
+        <div class="ccm-row">
+          <span class="ccm-ring ccm-provider-ring" aria-hidden="true"></span>
+          <span class="ccm-provider-value">Provider Left --</span>
+        </div>
+        <div class="ccm-track">
+          <div class="ccm-fill ccm-provider-fill"></div>
+        </div>
+      </div>
+      <div class="ccm-history-panel" aria-hidden="true">
+        <div class="ccm-history-grid">
+          <div class="ccm-history-section" data-history-kind="context">
+            <div class="ccm-history-head">
+              <span class="ccm-history-title">Context / Session</span>
+              <span class="ccm-history-total">--</span>
+            </div>
+            <div class="ccm-history-chart"></div>
+          </div>
+          <div class="ccm-history-section" data-history-kind="provider">
+            <div class="ccm-history-head">
+              <span class="ccm-history-title">Provider / Session</span>
+              <span class="ccm-history-total">--</span>
+            </div>
+            <div class="ccm-history-chart"></div>
+          </div>
+        </div>
       </div>
     `;
-    document.body.appendChild(root);
     state.root = root;
+    state.contextCard = root.querySelector(".ccm-context-card");
+    state.providerCard = root.querySelector(".ccm-provider-card");
+    state.historyPanel = root.querySelector(".ccm-history-panel");
     state.value = root.querySelector(".ccm-value");
     state.fill = root.querySelector(".ccm-fill");
+    state.providerValue = root.querySelector(".ccm-provider-value");
+    state.providerFill = root.querySelector(".ccm-provider-fill");
+    installHistoryHover(root);
+    installContextMenu(root);
+    installFloatingControls(root);
+    mountRoot(root);
     return root;
+  }
+
+  function findInlineMount() {
+    const visibleDirectChildren = (node) =>
+      Array.from(node.children || []).filter((child) => child.id !== ROOT_ID && isVisibleElement(child));
+    const buttonLikeCount = (node) =>
+      Array.from(node.querySelectorAll("button, [role='button']")).filter((child) => isVisibleElement(child)).length;
+    const nodeLabel = (node) =>
+      `${node.textContent || ""} ${node.getAttribute?.("aria-label") || ""} ${node.getAttribute?.("title") || ""} ${node.getAttribute?.("data-testid") || ""}`;
+    const isComposerAction = (node) =>
+      /send|submit|attach|upload|file|image|screenshot|voice|audio|mic|microphone|dictat/i.test(nodeLabel(node));
+    const looksLikeProviderModelControl = (node) => {
+      if (!node || node.id === ROOT_ID || !isVisibleElement(node)) return false;
+      if (node.closest("textarea, input, [contenteditable='true'], [role='textbox']")) return false;
+      if (isComposerAction(node)) return false;
+
+      const label = nodeLabel(node).trim();
+      if (/provider|model|gpt-|claude|gemini|codex|auto|standard|reason|thinking|high|medium|low|o[0-9]/i.test(label)) return true;
+      return /\S{2,}/.test(label) && Boolean(node.querySelector("button, [role='button'], [aria-haspopup], svg"));
+    };
+    const findProviderModelBefore = (toolbar) => {
+      const children = visibleDirectChildren(toolbar).sort(
+        (left, right) => left.getBoundingClientRect().left - right.getBoundingClientRect().left
+      );
+      return children.find(looksLikeProviderModelControl) || null;
+    };
+    const isComposerArea = (node) => {
+      const rect = node && node.getBoundingClientRect();
+      if (!rect || rect.top < window.innerHeight * 0.45) return false;
+      if (node.closest(CONVERSATION_CONTENT_SELECTOR)) return false;
+      if (node.closest("aside, nav, [data-app-action-sidebar-thread-id], [data-app-action-sidebar-thread-active], [class*='sidebar' i]")) return false;
+      if (node.closest("article, [data-message-author-role], [data-testid*='message' i], [data-testid*='conversation' i]")) return false;
+      if (!node.querySelector("textarea, input, [contenteditable='true'], [role='textbox']")) return false;
+      return true;
+    };
+    const findComposerArea = (node) => {
+      let current = node;
+      while (current && current !== document.body) {
+        if (isComposerArea(current)) return current;
+        current = current.parentElement;
+      }
+      return null;
+    };
+    const directChildOf = (parent, node) => {
+      let current = node;
+      while (current && current.parentElement && current.parentElement !== parent) {
+        current = current.parentElement;
+      }
+      return current && current.parentElement === parent ? current : null;
+    };
+    const findToolbarForButton = (button) => {
+      let current = button.parentElement;
+      while (current && current !== document.body) {
+        const rect = current.getBoundingClientRect();
+        if (rect.top < window.innerHeight * 0.45) break;
+        if (current.closest(CONVERSATION_CONTENT_SELECTOR)) break;
+        const children = visibleDirectChildren(current);
+        const hasModel = /gpt-|o[0-9]|auto|high|medium|low|standard|模型/i.test(current.textContent || "");
+        const hasSubmit = /send|提交|发送/i.test(current.textContent || "");
+        if (children.length >= 3 && buttonLikeCount(current) >= 2 && (hasModel || hasSubmit)) {
+          return current;
+        }
+        current = current.parentElement;
+      }
+      return button.parentElement || button;
+    };
+    const firstVisibleChild = (node) => visibleDirectChildren(node)[0] || null;
+    const classText = (node) => (typeof node?.className === "string" ? node.className : "");
+    const findComposerFooterMount = () => {
+      const footers = Array.from(document.querySelectorAll(".composer-footer"))
+        .filter((footer) => isVisibleElement(footer) && footer.getBoundingClientRect().top > window.innerHeight * 0.45)
+        .sort((left, right) => right.getBoundingClientRect().top - left.getBoundingClientRect().top);
+
+      for (const footer of footers) {
+        const rightGroup = visibleDirectChildren(footer).find((child) => {
+          const className = classText(child);
+          if (!/justify-end/.test(className)) return false;
+          if (!child.querySelector("button, [role='button'], [aria-haspopup]")) return false;
+          return !/full access/i.test(nodeLabel(child));
+        });
+        if (!rightGroup) continue;
+
+        const providerGroup =
+          visibleDirectChildren(rightGroup).find((child) => {
+            const className = classText(child);
+            if (!/justify-end/.test(className)) return false;
+            if (!child.querySelector("button, [role='button'], [aria-haspopup]")) return false;
+            return !isComposerAction(child);
+          }) || rightGroup;
+        return {
+          parent: providerGroup,
+          before: firstVisibleChild(providerGroup),
+        };
+      }
+
+      return null;
+    };
+    const findToolbarForProviderModel = (control) => {
+      let current = control.parentElement;
+      while (current && current !== document.body) {
+        const rect = current.getBoundingClientRect();
+        if (rect.top < window.innerHeight * 0.45) break;
+        if (current.closest(CONVERSATION_CONTENT_SELECTOR)) break;
+        const children = visibleDirectChildren(current);
+        if (children.length >= 2 && children.some(looksLikeProviderModelControl)) return current;
+        current = current.parentElement;
+      }
+      return control.parentElement || control;
+    };
+
+    const footerMount = findComposerFooterMount();
+    if (footerMount) return footerMount;
+
+    const providerModelControls = Array.from(document.querySelectorAll("button, [role='button'], [aria-haspopup]"))
+      .filter(looksLikeProviderModelControl)
+      .sort((left, right) => {
+        const leftRect = left.getBoundingClientRect();
+        const rightRect = right.getBoundingClientRect();
+        return rightRect.top - leftRect.top || leftRect.left - rightRect.left;
+      });
+    for (const control of providerModelControls) {
+      const bar = findComposerArea(control);
+      if (!bar || !isVisibleElement(bar) || !isComposerArea(bar)) continue;
+      const toolbar = findToolbarForProviderModel(control);
+      const before = directChildOf(toolbar, control) || findProviderModelBefore(toolbar) || firstVisibleChild(toolbar);
+      return {
+        parent: toolbar,
+        before,
+      };
+    }
+
+    const sendButtons = Array.from(document.querySelectorAll("button, [role='button']"));
+    for (const button of sendButtons) {
+      if (!isVisibleElement(button) || button.closest(`#${ROOT_ID}`)) continue;
+      const text = `${button.textContent || ""} ${button.getAttribute("aria-label") || ""} ${button.getAttribute("title") || ""}`;
+      if (!/send|提交|发送/i.test(text)) continue;
+
+      const bar = findComposerArea(button);
+      if (!bar || !isVisibleElement(bar)) continue;
+      if (!isComposerArea(bar)) continue;
+      const toolbar = findToolbarForButton(button);
+      const providerModelBefore = findProviderModelBefore(toolbar);
+      return {
+        parent: toolbar,
+        before: providerModelBefore || firstVisibleChild(toolbar),
+      };
+    }
+
+    return null;
+  }
+
+  function mountRoot(root) {
+    state.uiState = readUiState();
+    if (state.uiState.mode === "floating") {
+      if (root.parentNode !== document.body) document.body.appendChild(root);
+      state.inlineHost = null;
+      root.dataset.placement = "floating";
+      applyFloatingUiState(root);
+      return;
+    }
+
+    const mount = findInlineMount();
+    if (!mount || !mount.parent || root.contains(mount.parent)) {
+      state.inlineHost = null;
+      state.inlineBefore = null;
+      if (root.parentNode !== document.body) document.body.appendChild(root);
+      root.dataset.placement = "floating";
+      applyFloatingUiState(root);
+      return;
+    }
+
+    const before = mount.before || null;
+    if (before !== root && (root.parentNode !== mount.parent || root.nextSibling !== before)) {
+      mount.parent.insertBefore(root, before);
+    }
+    state.inlineHost = mount.parent;
+    state.inlineBefore = before;
+    root.dataset.placement = "inline";
+  }
+
+  function applyFloatingUiState(root) {
+    const uiState = state.uiState || DEFAULT_FLOATING_UI;
+    root.style.setProperty("--ccm-float-x", `${Math.round(uiState.x)}px`);
+    root.style.setProperty("--ccm-float-y", `${Math.round(uiState.y)}px`);
+    root.style.setProperty("--ccm-float-scale", String(uiState.scale));
+    root.dataset.floatingLayout = uiState.floatingLayout === "vertical" ? "vertical" : "horizontal";
+  }
+
+  function setUiMode(mode) {
+    state.uiState = {
+      ...readUiState(),
+      mode: mode === "floating" ? "floating" : "inline",
+    };
+    writeUiState();
+    closeContextMenu();
+    const root = state.root || document.getElementById(ROOT_ID);
+    if (root) mountRoot(root);
+  }
+
+  function setFloatingLayout(layout) {
+    state.uiState = {
+      ...readUiState(),
+      floatingLayout: layout === "vertical" ? "vertical" : "horizontal",
+    };
+    writeUiState();
+    closeContextMenu();
+    const root = state.root || document.getElementById(ROOT_ID);
+    if (root) applyFloatingUiState(root);
+  }
+
+  function closeContextMenu() {
+    if (state.contextMenu) {
+      state.contextMenu.remove();
+      state.contextMenu = null;
+    }
+    if (state.contextMenuCloseListener) {
+      document.removeEventListener("pointerdown", state.contextMenuCloseListener, true);
+      document.removeEventListener("keydown", state.contextMenuCloseListener, true);
+      state.contextMenuCloseListener = null;
+    }
+  }
+
+  function openContextMenu(event) {
+    const root = state.root || document.getElementById(ROOT_ID);
+    if (!root || !root.contains(event.target)) return;
+    event.preventDefault();
+    closeContextMenu();
+
+    const currentMode = (state.uiState && state.uiState.mode) === "floating" ? "floating" : "inline";
+    const currentFloatingLayout =
+      (state.uiState && state.uiState.floatingLayout) === "vertical" ? "vertical" : "horizontal";
+    const menu = document.createElement("div");
+    menu.className = "ccm-context-menu";
+    menu.setAttribute("role", "menu");
+    const createRadioItem = (group, value, label, checked) => {
+      const item = document.createElement("button");
+      item.type = "button";
+      item.dataset[group] = value;
+      item.setAttribute("role", "menuitemradio");
+      item.setAttribute("aria-checked", checked ? "true" : "false");
+
+      const check = document.createElement("span");
+      check.className = "ccm-menu-check";
+      check.setAttribute("aria-hidden", "true");
+      check.textContent = checked ? "✓" : "";
+
+      const text = document.createElement("span");
+      text.textContent = label;
+
+      item.append(check, text);
+      return item;
+    };
+    const items = [
+      createRadioItem("mode", "inline", "Inline mode", currentMode === "inline"),
+      createRadioItem("mode", "floating", "Floating mode", currentMode === "floating"),
+    ];
+    if (currentMode === "floating") {
+      const separator = document.createElement("div");
+      separator.className = "ccm-menu-separator";
+      separator.setAttribute("role", "separator");
+      const hint = document.createElement("div");
+      hint.className = "ccm-menu-hint";
+      hint.textContent = "Use mouse wheel to resize";
+      items.push(
+        separator,
+        createRadioItem("floatingLayout", "horizontal", "Horizontal layout", currentFloatingLayout === "horizontal"),
+        createRadioItem("floatingLayout", "vertical", "Vertical layout", currentFloatingLayout === "vertical"),
+        hint,
+      );
+    }
+    menu.replaceChildren(...items);
+    const x = Math.min(event.clientX, window.innerWidth - 170);
+    const y = Math.min(event.clientY, window.innerHeight - 80);
+    menu.style.left = `${Math.max(6, x)}px`;
+    menu.style.top = `${Math.max(6, y)}px`;
+    menu.addEventListener("pointerdown", (menuEvent) => {
+      menuEvent.stopPropagation();
+    });
+    menu.addEventListener("click", (menuEvent) => {
+      const button = menuEvent.target && menuEvent.target.closest("button[data-mode]");
+      if (button) {
+        setUiMode(button.dataset.mode);
+        return;
+      }
+
+      const layoutButton = menuEvent.target && menuEvent.target.closest("button[data-floating-layout]");
+      if (layoutButton) setFloatingLayout(layoutButton.dataset.floatingLayout);
+    });
+    document.body.appendChild(menu);
+    state.contextMenu = menu;
+    state.contextMenuCloseListener = (closeEvent) => {
+      if (closeEvent.type === "keydown" && closeEvent.key !== "Escape") return;
+      if (state.contextMenu && closeEvent.target && state.contextMenu.contains(closeEvent.target)) return;
+      closeContextMenu();
+    };
+    window.setTimeout(() => {
+      document.addEventListener("pointerdown", state.contextMenuCloseListener, true);
+      document.addEventListener("keydown", state.contextMenuCloseListener, true);
+    }, 0);
+  }
+
+  function installContextMenu(root) {
+    if (!root || root.dataset.contextMenuInstalled === "true") return;
+    root.dataset.contextMenuInstalled = "true";
+    root.addEventListener("contextmenu", openContextMenu);
+  }
+
+  function clampFloatingPosition(root, x, y, scale) {
+    const rect = root.getBoundingClientRect();
+    const safeScale = clampNumber(scale, FLOAT_SCALE_MIN, FLOAT_SCALE_MAX);
+    const width = Math.max(40, rect.width / (Number(state.uiState.scale) || 1) * safeScale);
+    const height = Math.max(28, rect.height / (Number(state.uiState.scale) || 1) * safeScale);
+    return {
+      x: clampNumber(x, 0, Math.max(0, window.innerWidth - width)),
+      y: clampNumber(y, 0, Math.max(0, window.innerHeight - height)),
+      scale: safeScale,
+    };
+  }
+
+  function installFloatingControls(root) {
+    if (!root || root.dataset.floatingControlsInstalled === "true") return;
+    root.dataset.floatingControlsInstalled = "true";
+
+    const onPointerDown = (event) => {
+      if (root.dataset.placement !== "floating" || event.button !== 0) return;
+      if (event.target && event.target.closest(".ccm-context-menu")) return;
+
+      const uiState = readUiState();
+      const startX = event.clientX;
+      const startY = event.clientY;
+      const pointerId = event.pointerId;
+      let dragging = false;
+      const holdTimer = window.setTimeout(() => {
+        dragging = true;
+        root.dataset.dragging = "true";
+        try {
+          root.setPointerCapture(pointerId);
+        } catch {
+        }
+      }, FLOAT_DRAG_HOLD_MS);
+
+      const onPointerMove = (moveEvent) => {
+        if (!dragging) return;
+        const next = clampFloatingPosition(
+          root,
+          uiState.x + moveEvent.clientX - startX,
+          uiState.y + moveEvent.clientY - startY,
+          uiState.scale,
+        );
+        state.uiState = { ...uiState, ...next, mode: "floating" };
+        applyFloatingUiState(root);
+      };
+
+      const finish = () => {
+        window.clearTimeout(holdTimer);
+        document.removeEventListener("pointermove", onPointerMove, true);
+        document.removeEventListener("pointerup", finish, true);
+        document.removeEventListener("pointercancel", finish, true);
+        if (dragging) {
+          root.dataset.dragging = "false";
+          writeUiState();
+        }
+      };
+
+      document.addEventListener("pointermove", onPointerMove, true);
+      document.addEventListener("pointerup", finish, true);
+      document.addEventListener("pointercancel", finish, true);
+    };
+
+    const onWheel = (event) => {
+      if (root.dataset.placement !== "floating") return;
+      event.preventDefault();
+      const current = readUiState();
+      const direction = event.deltaY < 0 ? 1 : -1;
+      const nextScale = clampNumber(current.scale + direction * FLOAT_SCALE_STEP, FLOAT_SCALE_MIN, FLOAT_SCALE_MAX);
+      const next = clampFloatingPosition(root, current.x, current.y, nextScale);
+      state.uiState = { ...current, ...next, mode: "floating" };
+      applyFloatingUiState(root);
+      writeUiState();
+    };
+
+    root.addEventListener("pointerdown", onPointerDown);
+    root.addEventListener("wheel", onWheel, { passive: false });
+    state.floatingPointerCleanup = () => {
+      root.removeEventListener("pointerdown", onPointerDown);
+      root.removeEventListener("wheel", onWheel);
+    };
   }
 
   function toNumber(value, unit) {
@@ -343,6 +1276,101 @@
     return Math.max(0, Math.min(100, value));
   }
 
+  function clampNumber(value, min, max) {
+    if (!Number.isFinite(value)) return min;
+    return Math.max(min, Math.min(max, value));
+  }
+
+  function numberOrDefault(value, fallback) {
+    const number = Number(value);
+    return Number.isFinite(number) ? number : fallback;
+  }
+
+  function readUiState() {
+    try {
+      const parsed = JSON.parse(localStorage.getItem(UI_STATE_STORAGE_KEY) || "null");
+      const input = parsed && typeof parsed === "object" ? parsed : {};
+      return {
+        mode: input.mode === "floating" ? "floating" : "inline",
+        floatingLayout: input.floatingLayout === "vertical" ? "vertical" : "horizontal",
+        x: clampNumber(Number(input.x), 0, Math.max(0, window.innerWidth - 80)),
+        y: clampNumber(Number(input.y), 0, Math.max(0, window.innerHeight - 40)),
+        scale: clampNumber(Number(input.scale) || 1, FLOAT_SCALE_MIN, FLOAT_SCALE_MAX),
+      };
+    } catch {
+      return { ...DEFAULT_FLOATING_UI };
+    }
+  }
+
+  function writeUiState() {
+    try {
+      localStorage.setItem(UI_STATE_STORAGE_KEY, JSON.stringify(state.uiState));
+    } catch {
+    }
+  }
+
+  function shouldShowUsedInsteadOfLeft(config = state.uiConfig) {
+    const context = config && config.context;
+    return !!(context && context.showUsedInsteadOfLeft === true);
+  }
+
+  function normalizeLevelThresholds(value, defaults) {
+    const input = value && typeof value === "object" ? value : {};
+
+    return {
+      criticalLeftPercent: clampPercent(numberOrDefault(input.criticalLeftPercent, defaults.criticalLeftPercent)),
+      dangerLeftPercent: clampPercent(numberOrDefault(input.dangerLeftPercent, defaults.dangerLeftPercent)),
+      warnLeftPercent: clampPercent(numberOrDefault(input.warnLeftPercent, defaults.warnLeftPercent)),
+      noticeLeftPercent: clampPercent(numberOrDefault(input.noticeLeftPercent, defaults.noticeLeftPercent)),
+    };
+  }
+
+  function normalizeUiConfig(value) {
+    const input = value && typeof value === "object" ? value : {};
+    const context = input.context && typeof input.context === "object" ? input.context : {};
+    const provider = input.provider && typeof input.provider === "object" ? input.provider : {};
+
+    return {
+      context: {
+        showUsedInsteadOfLeft: context.showUsedInsteadOfLeft === true,
+        compressionWarningLeftPercent: clampPercent(numberOrDefault(
+          context.compressionWarningLeftPercent,
+          DEFAULT_UI_CONFIG.context.compressionWarningLeftPercent,
+        )),
+        levelThresholds: normalizeLevelThresholds(
+          context.levelThresholds,
+          DEFAULT_UI_CONFIG.context.levelThresholds,
+        ),
+      },
+      provider: {
+        levelThresholds: normalizeLevelThresholds(
+          provider.levelThresholds,
+          DEFAULT_UI_CONFIG.provider.levelThresholds,
+        ),
+      },
+    };
+  }
+
+  function readUiConfig() {
+    const summaryConfig = state.providerSummary && state.providerSummary.ui;
+    return normalizeUiConfig(summaryConfig || window[CONFIG_KEY] || DEFAULT_UI_CONFIG);
+  }
+
+  function levelForLeftPercent(leftPercent, scope) {
+    const config = scope === "provider" ? state.uiConfig.provider : state.uiConfig.context;
+    const thresholds = config.levelThresholds;
+    if (leftPercent <= thresholds.criticalLeftPercent) return "critical";
+    if (leftPercent <= thresholds.dangerLeftPercent) return "danger";
+    if (leftPercent <= thresholds.warnLeftPercent) return "warn";
+    if (leftPercent <= thresholds.noticeLeftPercent) return "notice";
+    return "normal";
+  }
+
+  function shouldShowCompressionWarning(leftPercent) {
+    const threshold = state.uiConfig.context.compressionWarningLeftPercent;
+    return Number.isFinite(threshold) && leftPercent <= threshold;
+  }
+
   function compactNumber(value) {
     if (!Number.isFinite(value)) return "";
     if (value >= 1000000) return `${(value / 1000000).toFixed(1)}M`;
@@ -350,17 +1378,545 @@
     return String(Math.round(value));
   }
 
-  function showTokenSpendEffect(root, deltaTokens) {
-    if (!root || !Number.isFinite(deltaTokens) || deltaTokens <= 0) return;
+  function formatTokenCount(value) {
+    if (!Number.isFinite(value)) return "--";
+    return Math.round(value).toLocaleString("en-US");
+  }
+
+  function formatAmount(value) {
+    if (!Number.isFinite(value)) return "--";
+    if (Math.abs(value) >= 1000) return value.toLocaleString("en-US", { maximumFractionDigits: 1 });
+    return value.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  }
+
+  function formatMoney(value) {
+    const amount = formatAmount(value);
+    return amount === "--" ? amount : `$${amount}`;
+  }
+
+  function formatProviderTitle(name, provider, usedAmount, remainingAmount, totalAmount, usedPercent, leftPercent) {
+    return [
+      `${name} Balance`,
+      `Left: ${formatMoney(remainingAmount)} (${leftPercent.toFixed(1)}%)`,
+      `Used: ${formatMoney(usedAmount)} (${usedPercent.toFixed(1)}%)`,
+      `Total: ${formatMoney(totalAmount)}`,
+      `Status: ${provider.status || "unknown"}`,
+    ].join(" | ");
+  }
+
+  function formatContextTitle(reading, usedTokens, remainingTokens, leftPercent, usedPercent) {
+    const limitTokens = Number.isFinite(reading.limit) ? reading.limit : null;
+    const parts = [
+      "Context",
+      `Left: ${formatTokenCount(remainingTokens)} Tokens (${leftPercent.toFixed(1)}%)`,
+      `Used: ${formatTokenCount(usedTokens)} Tokens (${usedPercent.toFixed(1)}%)`,
+    ];
+    if (Number.isFinite(limitTokens)) parts.push(`Total: ${formatTokenCount(limitTokens)} Tokens`);
+    if (reading.source) parts.push(`Source: ${reading.source}`);
+    return parts.join(" | ");
+  }
+
+  function pruneSpendHistory(now = Date.now()) {
+    const cutoff = now - SPEND_HISTORY_WINDOW_MS;
+    for (const kind of ["context", "provider"]) {
+      const items = state.spendHistory[kind];
+      while (items.length && items[0].time < cutoff) items.shift();
+      if (items.length > SPEND_HISTORY_MAX_ITEMS) {
+        items.splice(0, items.length - SPEND_HISTORY_MAX_ITEMS);
+      }
+    }
+  }
+
+  function recordSpend(kind, amount, meta) {
+    if (!Number.isFinite(amount) || amount <= 0 || !state.spendHistory[kind]) return;
+
+    const now = Date.now();
+    const conversationId =
+      kind === "context"
+        ? normalizeConversationId(meta || state.activeConversationId || "__unknown__") || "__unknown__"
+        : metaConversationId();
+    const itemMeta = kind === "provider" ? String(meta || "") : "";
+    if (kind === "context") {
+      const previousTotal = state.contextSessionTotalsByConversationId.get(conversationId) || 0;
+      state.contextSessionTotalsByConversationId.set(conversationId, previousTotal + amount);
+    } else {
+      const previousTotal = state.providerSessionTotalsByConversationId.get(conversationId) || 0;
+      state.providerSessionTotalsByConversationId.set(conversationId, previousTotal + amount);
+    }
+
+    state.spendHistory[kind].push({
+      time: now,
+      amount,
+      conversationId,
+      meta: itemMeta,
+    });
+    pruneSpendHistory(now);
+    if (state.root && state.root.dataset.historyOpen === "true") {
+      renderSpendHistory();
+    }
+  }
+
+  function formatHistoryTime(time) {
+    const date = new Date(time);
+    return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  }
+
+  function formatHistoryDelta(kind, amount) {
+    if (kind === "provider") return `-${formatMoney(amount)}`;
+    return `-${Math.round(amount).toLocaleString("en-US")} Tokens`;
+  }
+
+  function formatHistoryAxisValue(kind, amount) {
+    if (kind === "provider") return formatMoney(amount);
+    if (!Number.isFinite(amount)) return "--";
+    if (amount >= 1000000) return `${(amount / 1000000).toFixed(1)}M`;
+    if (amount >= 1000) return `${(amount / 1000).toFixed(1)}K`;
+    return String(Math.round(amount));
+  }
+
+  function formatHistoryPointTitle(kind, point) {
+    const lines = [
+      `${formatHistoryTime(point.item.time)} ${formatHistoryDelta(kind, point.item.amount)}`,
+    ];
+    if (point.item.meta) lines.push(String(point.item.meta));
+    return lines.join("\n");
+  }
+
+  function svgPoint(value) {
+    return Number.isFinite(value) ? value.toFixed(1) : "0.0";
+  }
+
+  function makeSpendHistoryChart(items, kind) {
+    const now = Date.now();
+    const cutoff = now - SPEND_HISTORY_WINDOW_MS;
+    const width = SPEND_HISTORY_CHART_WIDTH;
+    const height = SPEND_HISTORY_CHART_HEIGHT;
+    const padding = SPEND_HISTORY_CHART_PADDING;
+    const axisWidth = SPEND_HISTORY_CHART_AXIS_WIDTH;
+    const plotLeft = axisWidth;
+    const plotRight = width - padding;
+    const plotTop = padding;
+    const plotBottom = height - padding;
+    const innerWidth = plotRight - plotLeft;
+    const innerHeight = height - padding * 2;
+    const chart = document.createElement("div");
+    chart.className = "ccm-history-chart";
+
+    const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    svg.setAttribute("class", "ccm-history-svg");
+    svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
+    svg.setAttribute("preserveAspectRatio", "none");
+    svg.setAttribute("aria-hidden", "true");
+
+    const validItems = [];
+    for (const item of items) {
+      if (!Number.isFinite(item.amount) || item.amount <= 0) continue;
+      const time = Number(item.time);
+      if (!Number.isFinite(time) || time < cutoff) continue;
+      validItems.push({
+        time: clampNumber(time, cutoff, now),
+        amount: item.amount,
+        meta: item.meta || "",
+      });
+    }
+
+    if (!validItems.length) {
+      const empty = document.createElement("div");
+      empty.className = "ccm-history-empty";
+      empty.textContent = "No spend in the last hour";
+      chart.append(svg, empty);
+      return chart;
+    }
+
+    const firstTime = validItems[0].time;
+    const lastTime = validItems[validItems.length - 1].time;
+    const timeSpan = lastTime - firstTime;
+    const useIndexAxis = validItems.length === 1 || timeSpan <= 0;
+    const axisLabel = formatHistoryTime(firstTime) === formatHistoryTime(lastTime)
+      ? formatHistoryTime(firstTime)
+      : `${formatHistoryTime(firstTime)}-${formatHistoryTime(lastTime)}`;
+    const rawPoints = [];
+    validItems.forEach((item, index) => {
+      const xRatio = useIndexAxis
+        ? index / Math.max(validItems.length - 1, 1)
+        : (item.time - firstTime) / timeSpan;
+      const x = plotLeft + xRatio * innerWidth;
+      rawPoints.push({ x, value: item.amount, item });
+    });
+
+    const minValue = Math.min(...rawPoints.map((point) => point.value));
+    const maxValue = Math.max(...rawPoints.map((point) => point.value));
+    const fallbackRange = Math.max(maxValue, 1) * 0.12;
+    const axisMin = minValue === maxValue ? Math.max(0, minValue - fallbackRange) : minValue;
+    const axisMax = minValue === maxValue ? maxValue + fallbackRange : maxValue;
+    const axisRange = Math.max(axisMax - axisMin, 1);
+    const yForValue = (value) => plotBottom - ((value - axisMin) / axisRange) * innerHeight;
+    const points = rawPoints.map((point) => ({
+      ...point,
+      y: yForValue(point.value),
+    }));
+
+    if (points.length === 1) {
+      const onlyPoint = points[0];
+      points.push({
+        x: plotRight,
+        y: onlyPoint.y,
+        value: onlyPoint.value,
+        item: onlyPoint.item,
+        isSynthetic: true,
+      });
+    }
+
+    const yAxis = document.createElementNS("http://www.w3.org/2000/svg", "path");
+    yAxis.setAttribute("class", "ccm-history-axis-line");
+    yAxis.setAttribute("d", `M ${svgPoint(plotLeft)} ${svgPoint(plotTop)} V ${svgPoint(plotBottom)} H ${svgPoint(plotRight)}`);
+    svg.appendChild(yAxis);
+
+    const topGridline = document.createElementNS("http://www.w3.org/2000/svg", "path");
+    topGridline.setAttribute("class", "ccm-history-gridline");
+    topGridline.setAttribute("d", `M ${svgPoint(plotLeft)} ${svgPoint(plotTop)} H ${svgPoint(plotRight)}`);
+    svg.appendChild(topGridline);
+
+    const bottomGridline = document.createElementNS("http://www.w3.org/2000/svg", "path");
+    bottomGridline.setAttribute("class", "ccm-history-gridline");
+    bottomGridline.setAttribute("d", `M ${svgPoint(plotLeft)} ${svgPoint(plotBottom)} H ${svgPoint(plotRight)}`);
+    svg.appendChild(bottomGridline);
+
+    const topLabel = document.createElementNS("http://www.w3.org/2000/svg", "text");
+    topLabel.setAttribute("class", "ccm-history-axis-label");
+    topLabel.setAttribute("x", "2");
+    topLabel.setAttribute("y", svgPoint(plotTop + 4));
+    topLabel.textContent = formatHistoryAxisValue(kind, axisMax);
+    svg.appendChild(topLabel);
+
+    const bottomLabel = document.createElementNS("http://www.w3.org/2000/svg", "text");
+    bottomLabel.setAttribute("class", "ccm-history-axis-label");
+    bottomLabel.setAttribute("x", "2");
+    bottomLabel.setAttribute("y", svgPoint(plotBottom));
+    bottomLabel.textContent = formatHistoryAxisValue(kind, axisMin);
+    svg.appendChild(bottomLabel);
+
+    const linePath = points
+      .map((point, index) => `${index === 0 ? "M" : "L"} ${svgPoint(point.x)} ${svgPoint(point.y)}`)
+      .join(" ");
+    const areaPath = `${linePath} L ${svgPoint(points[points.length - 1].x)} ${svgPoint(plotBottom)} L ${svgPoint(points[0].x)} ${svgPoint(plotBottom)} Z`;
+
+    const area = document.createElementNS("http://www.w3.org/2000/svg", "path");
+    area.setAttribute("class", "ccm-history-area");
+    area.setAttribute("d", areaPath);
+    svg.appendChild(area);
+
+    const line = document.createElementNS("http://www.w3.org/2000/svg", "path");
+    line.setAttribute("class", "ccm-history-line");
+    line.setAttribute("d", linePath);
+    svg.appendChild(line);
+
+    const realPoints = points.filter((historyPoint) => !historyPoint.isSynthetic);
+    const lastPoint = realPoints[realPoints.length - 1] || points[points.length - 1];
+    for (const historyPoint of realPoints) {
+      const isLatestPoint = historyPoint === lastPoint;
+      const point = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+      point.setAttribute("class", "ccm-history-point");
+      point.setAttribute("cx", svgPoint(historyPoint.x));
+      point.setAttribute("cy", svgPoint(historyPoint.y));
+      point.setAttribute("r", isLatestPoint ? "3" : "2.4");
+      const pointTitle = document.createElementNS("http://www.w3.org/2000/svg", "title");
+      pointTitle.textContent = formatHistoryPointTitle(kind, historyPoint);
+      point.appendChild(pointTitle);
+      svg.appendChild(point);
+
+      const hit = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+      hit.setAttribute("class", "ccm-history-hit");
+      hit.setAttribute("cx", svgPoint(historyPoint.x));
+      hit.setAttribute("cy", svgPoint(historyPoint.y));
+      hit.setAttribute("r", "8");
+      const title = document.createElementNS("http://www.w3.org/2000/svg", "title");
+      title.textContent = formatHistoryPointTitle(kind, historyPoint);
+      hit.appendChild(title);
+      svg.appendChild(hit);
+    }
+
+    const caption = document.createElement("div");
+    caption.className = "ccm-history-caption";
+    const windowLabel = document.createElement("span");
+    windowLabel.textContent = axisLabel;
+    const lastLabel = document.createElement("span");
+    lastLabel.textContent = formatHistoryDelta(kind, lastPoint.item.amount);
+    if (lastPoint.item.meta) lastLabel.title = String(lastPoint.item.meta);
+    caption.append(windowLabel, lastLabel);
+
+    chart.append(svg, caption);
+    return chart;
+  }
+
+  function renderHistorySection(kind) {
+    const panel = state.historyPanel;
+    const section = panel && panel.querySelector(`[data-history-kind="${kind}"]`);
+    if (!section) return;
+
+    const visibleCard = kind === "provider" ? state.providerCard : state.contextCard;
+    if (!visibleCard || visibleCard.hidden) {
+      section.hidden = true;
+      return;
+    }
+    if (section.hidden) section.hidden = false;
+
+    pruneSpendHistory();
+    const conversationId = metaConversationId();
+    const items = state.spendHistory[kind].filter((item) => {
+      const itemConversationId = normalizeConversationId(item.conversationId || "__unknown__") || "__unknown__";
+      return itemConversationId === conversationId;
+    });
+    const total =
+      kind === "context"
+        ? contextSessionTotal(conversationId)
+        : providerSessionTotal(conversationId);
+    const totalNode = section.querySelector(".ccm-history-total");
+    const chart = section.querySelector(".ccm-history-chart");
+    if (totalNode) totalNode.textContent = total > 0 ? formatHistoryDelta(kind, total) : "--";
+    if (!chart) return;
+
+    chart.replaceWith(makeSpendHistoryChart(items, kind));
+  }
+
+  function metaConversationId() {
+    return normalizeConversationId(state.activeConversationId || (state.lastReading && state.lastReading.conversationId) || "__unknown__") || "__unknown__";
+  }
+
+  function contextSessionTotal(conversationId) {
+    const normalizedConversationId = normalizeConversationId(conversationId || "__unknown__") || "__unknown__";
+    return state.contextSessionTotalsByConversationId.get(normalizedConversationId) || 0;
+  }
+
+  function providerSessionTotal(conversationId) {
+    const normalizedConversationId = normalizeConversationId(conversationId || "__unknown__") || "__unknown__";
+    return state.providerSessionTotalsByConversationId.get(normalizedConversationId) || 0;
+  }
+
+  function renderSpendHistory() {
+    const grid = state.historyPanel && state.historyPanel.querySelector(".ccm-history-grid");
+    if (grid) {
+      grid.dataset.providerVisible = state.providerCard && !state.providerCard.hidden ? "true" : "false";
+    }
+    renderHistorySection("context");
+    renderHistorySection("provider");
+  }
+
+  function openSpendHistory() {
+    const root = state.root;
+    if (!root) return;
+    if (root.hidden) {
+      closeSpendHistory();
+      return;
+    }
+    if (state.historyCloseTimer) {
+      window.clearTimeout(state.historyCloseTimer);
+      state.historyCloseTimer = 0;
+    }
+    renderSpendHistory();
+    if (root.dataset.historyOpen !== "true") root.dataset.historyOpen = "true";
+    if (state.historyPanel) state.historyPanel.setAttribute("aria-hidden", "false");
+  }
+
+  function closeSpendHistory() {
+    const root = state.root;
+    if (!root) return;
+    if (state.historyCloseTimer) {
+      window.clearTimeout(state.historyCloseTimer);
+      state.historyCloseTimer = 0;
+    }
+    if (root.dataset.historyOpen !== "false") root.dataset.historyOpen = "false";
+    if (state.historyPanel) state.historyPanel.setAttribute("aria-hidden", "true");
+  }
+
+  function scheduleCloseSpendHistory(event) {
+    const root = state.root;
+    if (!root) return;
+    const relatedTarget = event && event.relatedTarget;
+    if (relatedTarget && typeof relatedTarget.nodeType === "number" && root.contains(relatedTarget)) return;
+    if (state.historyCloseTimer) window.clearTimeout(state.historyCloseTimer);
+    state.historyCloseTimer = window.setTimeout(() => {
+      state.historyCloseTimer = 0;
+      if (root.matches(":hover")) return;
+      closeSpendHistory();
+    }, HISTORY_PANEL_CLOSE_DELAY_MS);
+  }
+
+  function rectContainsPoint(rect, x, y) {
+    return !!rect && x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom;
+  }
+
+  function expandedRectContainsPoint(rect, x, y, expand) {
+    return !!rect &&
+      x >= rect.left - expand &&
+      x <= rect.right + expand &&
+      y >= rect.top - expand &&
+      y <= rect.bottom + expand;
+  }
+
+  function isPointerInsideHistorySurface(x, y) {
+    const root = state.root;
+    if (!root || root.hidden) return false;
+
+    const cards = [state.contextCard, state.providerCard].filter((card) => card && !card.hidden);
+    if (cards.some((card) => expandedRectContainsPoint(card.getBoundingClientRect(), x, y, 6))) {
+      return true;
+    }
+
+    if (state.historyPanel && root.dataset.historyOpen === "true") {
+      const panelRect = state.historyPanel.getBoundingClientRect();
+      if (expandedRectContainsPoint(panelRect, x, y, 6)) return true;
+
+      for (const card of cards) {
+        const cardRect = card.getBoundingClientRect();
+        const bridgeLeft = Math.min(cardRect.left, panelRect.left) - 6;
+        const bridgeRight = Math.max(cardRect.right, panelRect.right) + 6;
+        const bridgeTop = Math.min(cardRect.bottom, panelRect.top) - 2;
+        const bridgeBottom = Math.max(cardRect.bottom, panelRect.top) + 10;
+        if (x >= bridgeLeft && x <= bridgeRight && y >= bridgeTop && y <= bridgeBottom) return true;
+      }
+    }
+
+    return false;
+  }
+
+  function installHistoryPointerTracker(root) {
+    const onPointerMove = (event) => {
+      if (isPointerInsideHistorySurface(event.clientX, event.clientY)) {
+        openSpendHistory();
+      } else if (root.dataset.historyOpen === "true") {
+        scheduleCloseSpendHistory();
+      }
+    };
+    const onPointerLeave = () => {
+      if (root.dataset.historyOpen === "true") scheduleCloseSpendHistory();
+    };
+
+    document.addEventListener("pointermove", onPointerMove, { passive: true });
+    document.addEventListener("pointerdown", onPointerMove, { passive: true });
+    window.addEventListener("blur", closeSpendHistory);
+    document.addEventListener("mouseleave", onPointerLeave);
+
+    return () => {
+      document.removeEventListener("pointermove", onPointerMove);
+      document.removeEventListener("pointerdown", onPointerMove);
+      window.removeEventListener("blur", closeSpendHistory);
+      document.removeEventListener("mouseleave", onPointerLeave);
+    };
+  }
+
+  function installHistoryHover(root) {
+    if (!root) return;
+    if (state.historyHoverCleanup && root.dataset.historyHoverInstalled === "true") return;
+    if (state.historyHoverCleanup) state.historyHoverCleanup();
+    root.dataset.historyHoverInstalled = "true";
+    if (root.dataset.historyOpen !== "true") root.dataset.historyOpen = "false";
+    state.historyHoverCleanup = installHistoryPointerTracker(root);
+  }
+
+  function clearSpendEffects() {
+    window.clearTimeout(state.spendEffectTimer);
+    state.spendEffectTimer = 0;
+    state.spendEffectQueue.length = 0;
+    if (state.spendEffectActive) {
+      state.spendEffectActive.remove();
+      state.spendEffectActive = null;
+    }
+    const root = state.root || document.getElementById(ROOT_ID);
+    root?.querySelectorAll(".ccm-hit-pop").forEach((node) => node.remove());
+  }
+
+  function hasPendingSpendEffects() {
+    return !!(state.spendEffectActive || state.spendEffectQueue.length);
+  }
+
+  function finishSpendEffect(pop) {
+    if (state.spendEffectActive !== pop) return;
+    window.clearTimeout(state.spendEffectTimer);
+    state.spendEffectTimer = 0;
+    state.spendEffectActive = null;
+    pop.remove();
+    playNextSpendEffect();
+    if (!hasPendingSpendEffects()) {
+      const root = state.root || document.getElementById(ROOT_ID);
+      if (root) updateDockVisibility(root);
+    }
+  }
+
+  function playNextSpendEffect() {
+    if (state.spendEffectActive) return;
+    const root = state.root || document.getElementById(ROOT_ID);
+    if (!root || root.hidden) return;
+
+    const text = state.spendEffectQueue.shift();
+    if (!text) return;
 
     const pop = document.createElement("div");
     pop.className = "ccm-hit-pop";
-    pop.textContent = `-${Math.round(deltaTokens).toLocaleString("en-US")} Tokens`;
+    pop.textContent = text;
+    state.spendEffectActive = pop;
     root.appendChild(pop);
 
-    window.setTimeout(() => {
-      pop.remove();
-    }, 3100);
+    const onAnimationEnd = (event) => {
+      if (event.target !== pop || event.animationName !== "ccm-hit-pop") return;
+      pop.removeEventListener("animationend", onAnimationEnd);
+      finishSpendEffect(pop);
+    };
+    pop.addEventListener("animationend", onAnimationEnd);
+    state.spendEffectTimer = window.setTimeout(() => finishSpendEffect(pop), SPEND_EFFECT_FALLBACK_MS);
+  }
+
+  function enqueueSpendEffect(text) {
+    if (!text) return;
+    state.spendEffectQueue.push(text);
+    playNextSpendEffect();
+  }
+
+  function showTokenSpendEffect(deltaTokens) {
+    if (!Number.isFinite(deltaTokens) || deltaTokens <= 0) return;
+    enqueueSpendEffect(`-${Math.round(deltaTokens).toLocaleString("en-US")} Tokens`);
+  }
+
+  function showProviderSpendEffect(deltaAmount) {
+    if (!Number.isFinite(deltaAmount) || deltaAmount <= 0) return;
+    enqueueSpendEffect(`-${formatMoney(deltaAmount)}`);
+  }
+
+  function shouldShowContextSpendEffect(conversationId, currentUsed) {
+    if (!Number.isFinite(currentUsed)) return false;
+    const now = Date.now();
+    const normalizedConversationId = normalizeConversationId(conversationId || "__unknown__") || "__unknown__";
+    const roundedCurrentUsed = Math.round(currentUsed);
+    const previous = window[CONTEXT_SPEND_DEDUPE_KEY];
+    const isSameReading =
+      previous &&
+      previous.currentUsed === roundedCurrentUsed &&
+      (
+        previous.conversationId === normalizedConversationId ||
+        previous.conversationId === "__unknown__" ||
+        normalizedConversationId === "__unknown__"
+      );
+    if (isSameReading && now - previous.at < CONTEXT_SPEND_DEDUPE_WINDOW_MS) {
+      return false;
+    }
+    window[CONTEXT_SPEND_DEDUPE_KEY] = {
+      conversationId: normalizedConversationId,
+      currentUsed: roundedCurrentUsed,
+      at: now,
+    };
+    return true;
+  }
+
+  function shouldShowProviderSpendEffect(providerId, currentUsed) {
+    if (!providerId || !Number.isFinite(currentUsed)) return false;
+    const now = Date.now();
+    const key = `${providerId}:${currentUsed}`;
+    const previous = window[PROVIDER_SPEND_DEDUPE_KEY];
+    if (previous && previous.key === key && now - previous.at < PROVIDER_SPEND_DEDUPE_WINDOW_MS) {
+      return false;
+    }
+    window[PROVIDER_SPEND_DEDUPE_KEY] = { key, at: now };
+    return true;
   }
 
   function hasDescendant(element, selector) {
@@ -396,14 +1952,136 @@
     return url.protocol === "app:" && url.pathname.endsWith("/index.html");
   }
 
-  function hideMeter(root, value, fill, title) {
-    if (root.dataset.known !== "false") root.dataset.known = "false";
-    if (root.dataset.level !== "normal") root.dataset.level = "normal";
-    if (root.title !== title) root.title = title;
+  function updateDockVisibility(root) {
+    const contextVisible = state.contextCard && !state.contextCard.hidden;
+    const providerVisible = state.providerCard && !state.providerCard.hidden;
+    const hidden = !contextVisible && !providerVisible;
+    const keepVisibleForSpend = hidden && hasPendingSpendEffects();
+    root.hidden = hidden && !keepVisibleForSpend;
+    if (hidden) {
+      closeSpendHistory();
+      if (!keepVisibleForSpend) clearSpendEffects();
+    } else if (root.dataset.historyOpen === "true") {
+      renderSpendHistory();
+    }
+    if (!root.hidden) playNextSpendEffect();
+  }
+
+  function hideMeter(root, card, value, fill, title) {
+    if (!card) return;
+    if (card.dataset.known !== "false") card.dataset.known = "false";
+    if (card.dataset.level !== "normal") card.dataset.level = "normal";
+    if (card.dataset.compressionWarning !== "false") card.dataset.compressionWarning = "false";
+    if (card.title !== title) card.title = title;
     if (value.textContent !== "Context Left --") value.textContent = "Context Left --";
     if (fill.style.width !== "0%") fill.style.width = "0%";
-    root.hidden = true;
-    root.querySelectorAll(".ccm-hit-pop").forEach((node) => node.remove());
+    const ring = card.querySelector(".ccm-ring");
+    if (ring) ring.style.setProperty("--ccm-ring-angle", "0deg");
+    card.hidden = true;
+    updateDockVisibility(root);
+  }
+
+  function hideProviderMeter(root, reason) {
+    const card = state.providerCard;
+    if (!card) return;
+    if (card.dataset.known !== "false") card.dataset.known = "false";
+    if (card.dataset.level !== "normal") card.dataset.level = "normal";
+    if (card.title !== reason) card.title = reason;
+    if (state.providerFill && state.providerFill.style.width !== "0%") state.providerFill.style.width = "0%";
+    const ring = card.querySelector(".ccm-ring");
+    if (ring) ring.style.setProperty("--ccm-ring-angle", "0deg");
+    card.hidden = true;
+    updateDockVisibility(root);
+  }
+
+  function pickProviderSummary(summary) {
+    const providers = summary && Array.isArray(summary.providers) ? summary.providers : [];
+    return providers.find((provider) => provider && provider.status === "active") || null;
+  }
+
+  function renderProviderMeter(root) {
+    state.providerSummary = readProviderSummary();
+    state.uiConfig = readUiConfig();
+    const provider = pickProviderSummary(state.providerSummary);
+    if (!provider) {
+      hideProviderMeter(root, "No active provider summary is available.");
+      return;
+    }
+
+    const card = state.providerCard;
+    if (!card || !state.providerValue || !state.providerFill) return;
+
+    const usedPercent = clampPercent(Number(provider.usedPercent));
+    const remainingAmount = Number(provider.remainingAmount);
+    const totalAmount = Number(provider.totalAmount);
+    const usedAmount = Number.isFinite(Number(provider.usedAmount))
+      ? Number(provider.usedAmount)
+      : totalAmount - remainingAmount;
+    if (usedPercent == null || !Number.isFinite(remainingAmount) || !Number.isFinite(totalAmount) || !Number.isFinite(usedAmount)) {
+      hideProviderMeter(root, "Provider summary is missing quota values.");
+      return;
+    }
+
+    const leftPercent = clampPercent(100 - usedPercent);
+    const level = levelForLeftPercent(leftPercent, "provider");
+    const name = String(provider.displayName || provider.id || "Provider").slice(0, 48);
+    const text = `${name} Left ${leftPercent.toFixed(1)}% (${formatMoney(remainingAmount)} left)`;
+    const width = `${leftPercent.toFixed(1)}%`;
+    const title = formatProviderTitle(name, provider, usedAmount, remainingAmount, totalAmount, usedPercent, leftPercent);
+    const providerId = String(provider.id || name || "__provider__");
+    const currentUsed = Number(provider.used);
+
+    if (Number.isFinite(currentUsed)) {
+      const previousUsed = state.lastAnimatedProviderUsedById.get(providerId);
+      if (Number.isFinite(previousUsed) && currentUsed > previousUsed && Number.isFinite(provider.total) && provider.total > 0) {
+        const deltaAmount = (currentUsed - previousUsed) * (totalAmount / Number(provider.total));
+        if (shouldShowProviderSpendEffect(providerId, currentUsed)) {
+          recordSpend("provider", deltaAmount, providerId);
+          showProviderSpendEffect(deltaAmount);
+        }
+      }
+      state.lastAnimatedProviderUsedById.set(providerId, currentUsed);
+    }
+
+    if (card.dataset.known !== "true") card.dataset.known = "true";
+    if (card.dataset.level !== level) card.dataset.level = level;
+    if (card.title !== title) card.title = title;
+    if (state.providerValue.textContent !== text) state.providerValue.textContent = text;
+    if (state.providerFill.style.width !== width) state.providerFill.style.width = width;
+    const providerRing = card.querySelector(".ccm-ring");
+    if (providerRing) providerRing.style.setProperty("--ccm-ring-angle", `${leftPercent * 3.6}deg`);
+    if (card.hidden) card.hidden = false;
+    updateDockVisibility(root);
+  }
+
+  function readProviderSummary() {
+    const summary = window[PROVIDER_SUMMARY_KEY];
+    return summary && typeof summary === "object" ? summary : null;
+  }
+
+  // helper 通过 CDP 写入脱敏 summary；真实 token、用户 ID 和服务商地址不进入渲染页。
+  function setProviderSummary(summary) {
+    state.providerSummary = summary && typeof summary === "object" ? summary : null;
+    if (state.providerSummary) {
+      window[PROVIDER_SUMMARY_KEY] = state.providerSummary;
+      if (state.providerSummary.ui && typeof state.providerSummary.ui === "object") {
+        window[CONFIG_KEY] = normalizeUiConfig(state.providerSummary.ui);
+      }
+    }
+    const root = state.root || document.getElementById(ROOT_ID);
+    if (root) renderProviderMeter(root);
+  }
+
+  function installProviderSummaryListener() {
+    if (state.providerSummaryListener) return;
+    state.providerSummary = readProviderSummary();
+    state.providerSummaryListener = (event) => {
+      setProviderSummary(event && event.detail);
+    };
+    try {
+      window.addEventListener(PROVIDER_SUMMARY_EVENT, state.providerSummaryListener);
+    } catch {
+    }
   }
 
   function makeReading(percent, source, raw, used, limit) {
@@ -1992,38 +3670,45 @@
     if (!document.body) return;
 
     const root = ensureRoot();
+    state.uiConfig = readUiConfig();
+    const contextCard = state.contextCard;
     const value = state.value || root.querySelector(".ccm-value");
     const fill = state.fill || root.querySelector(".ccm-fill");
+    const compressionZone = root.querySelector(".ccm-context-card .ccm-compression-zone");
     const reading = detectReading();
     const activeConversationId = state.activeConversationId || readActiveConversationId();
 
-    if (!value || !fill) return;
+    if (!contextCard || !value || !fill) return;
 
     if (!hasThreadContentSurface()) {
       state.lastReading = null;
-      hideMeter(root, value, fill, "No thread content is open in the main view.");
+      hideProviderMeter(root, "No thread content is open in the main view.");
+      hideMeter(root, contextCard, value, fill, "No thread content is open in the main view.");
       return;
     }
+    renderProviderMeter(root);
 
     if (!reading) {
       if (state.waitingForAppSignalModules) {
         scheduleUpdate(APP_SIGNAL_IMPORT_GRACE_MS);
-        if (root.dataset.known === "true" && value.textContent !== "Context Left --") return;
-        hideMeter(root, value, fill, "Waiting for Codex context usage signal.");
+        if (contextCard.dataset.known === "true" && value.textContent !== "Context Left --") return;
+        hideMeter(root, contextCard, value, fill, "Waiting for Codex context usage signal.");
         return;
       }
 
       const title = activeConversationId
         ? `No context usage value is exposed for conversation ${activeConversationId} in the current page state yet.`
         : "No context usage value is exposed in the current page state yet.";
-      hideMeter(root, value, fill, title);
+      hideMeter(root, contextCard, value, fill, title);
       return;
     }
 
     state.lastReading = reading;
 
     const leftPercent = clampPercent(100 - reading.percent);
-    const percentText = leftPercent.toFixed(1);
+    const showUsedInsteadOfLeft = shouldShowUsedInsteadOfLeft(state.uiConfig);
+    const displayPercent = showUsedInsteadOfLeft ? clampPercent(reading.percent) : leftPercent;
+    const percentText = displayPercent.toFixed(1);
     const details =
       reading.used != null && reading.limit != null
         ? ` ${compactNumber(reading.used)} / ${compactNumber(reading.limit)}`
@@ -2035,22 +3720,46 @@
     if (readingConversationId && Number.isFinite(reading.used)) {
       const previousUsed = state.lastAnimatedUsedByConversationId.get(readingConversationId);
       if (Number.isFinite(previousUsed) && reading.used > previousUsed) {
-        showTokenSpendEffect(root, reading.used - previousUsed);
+        const deltaTokens = reading.used - previousUsed;
+        if (shouldShowContextSpendEffect(readingConversationId, reading.used)) {
+          recordSpend("context", deltaTokens, readingConversationId);
+          showTokenSpendEffect(deltaTokens);
+        }
       }
       state.lastAnimatedUsedByConversationId.set(readingConversationId, reading.used);
     }
 
-    const level = leftPercent <= 10 ? "danger" : leftPercent <= 25 ? "warn" : "normal";
-    const title = `Source: ${reading.source}${reading.raw ? ` | ${reading.raw}` : ""}`;
-    const text = `Context Left ${percentText}%${details}`;
-    const width = `${leftPercent.toFixed(1)}%`;
+    const level = levelForLeftPercent(leftPercent, "context");
+    const compressionWarning = shouldShowCompressionWarning(leftPercent) ? "true" : "false";
+    const remainingTokens = reading.used != null && reading.limit != null ? Math.max(0, reading.limit - reading.used) : null;
+    const title = formatContextTitle(reading, reading.used, remainingTokens, leftPercent, reading.percent);
+    const text = showUsedInsteadOfLeft
+      ? `Context Used ${percentText}%${details}`
+      : Number.isFinite(remainingTokens)
+        ? `Context Left ${percentText}% (${compactNumber(remainingTokens)} left)`
+        : `Context Left ${percentText}%${details}`;
+    const width = `${displayPercent.toFixed(1)}%`;
+    const compressionZoneWidth = `${state.uiConfig.context.compressionWarningLeftPercent.toFixed(1)}%`;
 
-    if (root.dataset.known !== "true") root.dataset.known = "true";
-    if (root.hidden) root.hidden = false;
-    if (root.dataset.level !== level) root.dataset.level = level;
-    if (root.title !== title) root.title = title;
+    if (contextCard.dataset.known !== "true") contextCard.dataset.known = "true";
+    if (contextCard.hidden) contextCard.hidden = false;
+    if (contextCard.dataset.level !== level) contextCard.dataset.level = level;
+    const showUsedInsteadOfLeftValue = showUsedInsteadOfLeft ? "true" : "false";
+    if (contextCard.dataset.showUsedInsteadOfLeft !== showUsedInsteadOfLeftValue) {
+      contextCard.dataset.showUsedInsteadOfLeft = showUsedInsteadOfLeftValue;
+    }
+    if (contextCard.dataset.compressionWarning !== compressionWarning) {
+      contextCard.dataset.compressionWarning = compressionWarning;
+    }
+    if (contextCard.title !== title) contextCard.title = title;
     if (value.textContent !== text) value.textContent = text;
     if (fill.style.width !== width) fill.style.width = width;
+    const contextRing = contextCard.querySelector(".ccm-ring");
+    if (contextRing) contextRing.style.setProperty("--ccm-ring-angle", `${displayPercent * 3.6}deg`);
+    if (compressionZone && compressionZone.style.width !== compressionZoneWidth) {
+      compressionZone.style.width = compressionZoneWidth;
+    }
+    updateDockVisibility(root);
   }
 
   function scheduleUpdate(delayMs = MUTATION_UPDATE_DELAY_MS) {
@@ -2130,16 +3839,33 @@
   window[API_KEY] = {
     version: SCRIPT_VERSION,
     refresh: updateMeter,
+    setProviderSummary,
     destroy() {
       window.clearInterval(state.timer);
       window.clearTimeout(state.pendingUpdate);
+      window.clearTimeout(state.historyCloseTimer);
       state.pendingUpdateDueAt = 0;
+      state.historyCloseTimer = 0;
+      if (state.historyHoverCleanup) {
+        state.historyHoverCleanup();
+        state.historyHoverCleanup = null;
+      }
+      if (state.floatingPointerCleanup) {
+        state.floatingPointerCleanup();
+        state.floatingPointerCleanup = null;
+      }
+      closeContextMenu();
+      clearSpendEffects();
       clearRetryUpdate();
       if (state.observer) state.observer.disconnect();
       if (state.navigationListener) {
         document.removeEventListener("pointerdown", state.navigationListener, true);
         document.removeEventListener("click", state.navigationListener, true);
         document.removeEventListener("keydown", state.navigationListener, true);
+      }
+      if (state.providerSummaryListener) {
+        window.removeEventListener(PROVIDER_SUMMARY_EVENT, state.providerSummaryListener);
+        state.providerSummaryListener = null;
       }
 
       const root = document.getElementById(ROOT_ID);
@@ -2170,6 +3896,7 @@
         animatedConversationIds: Array.from(state.lastAnimatedUsedByConversationId.keys()),
         hasAppSignalScope: isAppSignalScope(state.appSignalScope),
         hasAppSignalModules: !!state.appSignalModules,
+        providerSummary: state.providerSummary,
       };
     },
   };
@@ -2178,6 +3905,7 @@
   installFetchCapture();
   installWebSocketCapture();
   installPostMessageCapture();
+  installProviderSummaryListener();
   updateMeter();
   installObserver();
   state.timer = window.setInterval(updateMeter, UPDATE_INTERVAL_MS);
