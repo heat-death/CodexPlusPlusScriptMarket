@@ -17,6 +17,22 @@
       "homepage": "https://github.com/Minghou-Lei/codex-context-used-meter",
       "script_url": "https://raw.githubusercontent.com/BigPizzaV3/CodexPlusPlusScriptMarket/05fe34fee3e4dfa17a471a7b329a9a9313d844bb/scripts/codex-context-used-meter.js",
       "sha256": "f13df61c833b58048ba3f88b9013440e729dc7bc016dc578b7c6a708853344c0"
+    },
+    {
+      "id": "hide-usage-alert",
+      "name": "Hide Usage Alert",
+      "description": "隐藏 Codex Desktop 的额度提醒，适合 Codex++ 远程同步搭配 API Key 使用时减少 Free/Plus 账号额度弹窗干扰。",
+      "version": "4",
+      "author": "Ghibli1024",
+      "tags": [
+        "usage",
+        "quota",
+        "ui",
+        "hide"
+      ],
+      "homepage": "https://github.com/Ghibli1024/codex-hide-usage-alert",
+      "script_url": "https://raw.githubusercontent.com/BigPizzaV3/CodexPlusPlusScriptMarket/1e8ba79da3efb629153d79eaad678b2a48a801c5/scripts/hide-usage-alert.js",
+      "sha256": "031d7767ad5022e0be36a6213942de60b346b527667b174472cca4d3d0742073"
     }
   ]
 }
