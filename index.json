@@ -1,7 +1,24 @@
 {
   "version": 1,
-  "updated_at": "2026-05-25T08:46:56Z",
+  "updated_at": "2026-05-26T00:00:00Z",
   "scripts": [
+    {
+      "id": "codex-context-ring-restore",
+      "name": "Codex Context Ring Restore",
+      "description": "一款尽量还原官方圆环上下文体验的插件：贴近官方圆环的样式、位置与读数逻辑，尽可能保持原生使用感。",
+      "version": "0.1.2",
+      "author": "win9",
+      "tags": [
+        "context",
+        "ring",
+        "ui",
+        "restore",
+        "native"
+      ],
+      "homepage": "https://github.com/win9zhx/codex-context-ring-restore",
+      "script_url": "https://raw.githubusercontent.com/BigPizzaV3/CodexPlusPlusScriptMarket/main/scripts/codex-context-ring-restore.js",
+      "sha256": "e3d9409442f17112fe41542fefab8cd62b2776fc8808d8ac2d841630f127d676"
+    },
     {
       "id": "codex-context-used-meter",
       "name": "Codex Context Used Meter",
