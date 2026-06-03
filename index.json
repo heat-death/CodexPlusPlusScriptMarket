@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updated_at": "2026-06-02T11:14:21.482Z",
+  "updated_at": "2026-06-03T12:58:49.419Z",
   "scripts": [
     {
       "id": "codex-context-ring-restore",
@@ -39,7 +39,7 @@
       "id": "hide-usage-alert",
       "name": "Hide Usage Alert",
       "description": "隐藏 Codex Desktop 的额度提醒，适合 Codex++ 远程同步搭配 API Key 使用时减少 Free/Plus 账号额度弹窗干扰。",
-      "version": "4",
+      "version": "0.1.1",
       "author": "Ghibli1024",
       "tags": [
         "usage",
@@ -48,8 +48,8 @@
         "hide"
       ],
       "homepage": "https://github.com/Ghibli1024/codex-hide-usage-alert",
-      "script_url": "https://raw.githubusercontent.com/BigPizzaV3/CodexPlusPlusScriptMarket/1e8ba79da3efb629153d79eaad678b2a48a801c5/scripts/hide-usage-alert.js",
-      "sha256": "031d7767ad5022e0be36a6213942de60b346b527667b174472cca4d3d0742073"
+      "script_url": "https://raw.githubusercontent.com/BigPizzaV3/CodexPlusPlusScriptMarket/main/scripts/hide-usage-alert.js",
+      "sha256": "6f348e54d1be7367986d3e7cf349d21de74a87a47a1397cfcdb0715891b62bc3"
     },
     {
       "id": "codex-token-usage",
